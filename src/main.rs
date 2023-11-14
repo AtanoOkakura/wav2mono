@@ -10,9 +10,23 @@ use wav2mono::Wav;
 
 use eframe::egui;
 
-#[derive(Default)]
+#[derive(Debug, Clone)]
+enum AppState {
+    Idle,
+    Converting,
+    Completed,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Default, Debug)]
 struct MyApp {
     dropped_files: Arc<Mutex<Vec<egui::DroppedFile>>>,
+    app_state: Arc<Mutex<AppState>>,
 }
 
 impl eframe::App for MyApp {
@@ -48,12 +62,31 @@ impl eframe::App for MyApp {
                     }
                 });
 
-                let dropped_files = self.dropped_files.clone();
-                let _handle = thread::spawn(move || {
-                    if let Err(e) = convert_to_mono(dropped_files) {
-                        eprintln!("{}", e);
+                let state = self.app_state.lock().unwrap();
+                match state.clone() {
+                    AppState::Idle => {
+                        println!("app state idle");
+                        eprintln!("App state idle");
+                        let state = Arc::clone(&self.app_state);
+                        let file = dropped_files.last().unwrap().clone();
+                        *state.lock().unwrap() = AppState::Converting;
+                        thread::spawn(move || {
+                            if let Err(e) = convert_to_mono(file) {
+                                eprintln!("{}", e);
+                            }
+                            *state.lock().unwrap() = AppState::Completed;
+                        });
                     }
-                });
+                    AppState::Converting => {
+                        println!("app state converting");
+                        eprintln!("App state converting");
+                    }
+                    AppState::Completed => {
+                        println!("app state completed");
+                        self.dropped_files.lock().unwrap().pop();
+                        *self.app_state.lock().unwrap() = AppState::Idle;
+                    }
+                }
             }
         });
 
@@ -69,18 +102,14 @@ impl eframe::App for MyApp {
     }
 }
 
-fn convert_to_mono(files: Arc<Mutex<Vec<DroppedFile>>>) -> io::Result<()> {
-    let mut files = files.lock().unwrap();
-    for file in files.clone() {
-        let input = file.path.unwrap();
-        let output = input
-            .parent()
-            .unwrap()
-            .join("mono")
-            .join(input.file_name().unwrap());
-        Wav::open(&input).to_mono().write(&output)?;
-    }
-    files.clear();
+fn convert_to_mono(file: DroppedFile) -> io::Result<()> {
+    let input = file.path.unwrap();
+    let output = input
+        .parent()
+        .unwrap()
+        .join("mono")
+        .join(input.file_name().unwrap());
+    Wav::open(&input).to_mono().write(&output)?;
     Ok(())
 }
 
