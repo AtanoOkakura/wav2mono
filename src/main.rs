@@ -5,16 +5,14 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 
-use eframe::egui::DroppedFile;
 use wav2mono::Wav;
 
 use eframe::egui;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum AppState {
     Idle,
     Converting,
-    Completed,
 }
 
 impl Default for AppState {
@@ -47,7 +45,7 @@ impl eframe::App for MyApp {
             // Show dropped files (if any):
             if !dropped_files.is_empty() {
                 ui.group(|ui| {
-                    ui.label("Dropped files:");
+                    ui.label("Converting to mono:");
 
                     for file in dropped_files.clone() {
                         let info = if let Some(path) = &file.path {
@@ -61,34 +59,32 @@ impl eframe::App for MyApp {
                         ui.label(info);
                     }
                 });
-
-                let state = self.app_state.lock().unwrap();
-                match state.clone() {
-                    AppState::Idle => {
-                        println!("app state idle");
-                        eprintln!("App state idle");
-                        let state = Arc::clone(&self.app_state);
-                        let file = dropped_files.last().unwrap().clone();
-                        *state.lock().unwrap() = AppState::Converting;
-                        thread::spawn(move || {
-                            if let Err(e) = convert_to_mono(file) {
-                                eprintln!("{}", e);
-                            }
-                            *state.lock().unwrap() = AppState::Completed;
-                        });
-                    }
-                    AppState::Converting => {
-                        println!("app state converting");
-                        eprintln!("App state converting");
-                    }
-                    AppState::Completed => {
-                        println!("app state completed");
-                        self.dropped_files.lock().unwrap().pop();
-                        *self.app_state.lock().unwrap() = AppState::Idle;
-                    }
-                }
             }
         });
+
+        if !self.dropped_files.lock().unwrap().is_empty() {
+            let app_state = *self.app_state.lock().unwrap();
+            match app_state {
+                AppState::Idle => {
+                    let mut dropped_files = self.dropped_files.lock().unwrap();
+                    let file: PathBuf = dropped_files.pop().unwrap().path.unwrap();
+                    let state_store = Arc::clone(&self.app_state);
+
+                    *self.app_state.lock().unwrap() = AppState::Converting;
+
+                    thread::spawn(move || {
+                        if let Err(e) = convert_to_mono(file) {
+                            eprintln!("{}", e);
+                        }
+
+                        *state_store.lock().unwrap() = AppState::Idle;
+                    });
+                }
+                AppState::Converting => {
+                    println!("app state converting");
+                }
+            }
+        }
 
         preview_files_being_dropped(ctx);
 
@@ -102,14 +98,13 @@ impl eframe::App for MyApp {
     }
 }
 
-fn convert_to_mono(file: DroppedFile) -> io::Result<()> {
-    let input = file.path.unwrap();
-    let output = input
+fn convert_to_mono(file: PathBuf) -> io::Result<()> {
+    let output = file
         .parent()
         .unwrap()
         .join("mono")
-        .join(input.file_name().unwrap());
-    Wav::open(&input).to_mono().write(&output)?;
+        .join(file.file_name().unwrap());
+    Wav::open(&file).to_mono().write(&output)?;
     Ok(())
 }
 

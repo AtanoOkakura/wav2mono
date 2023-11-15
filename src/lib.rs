@@ -1,7 +1,7 @@
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use wav::bit_depth::BitDepth;
 use wav::header::Header;
@@ -25,7 +25,7 @@ pub fn wav_file_to_mono(path: &Path) -> io::Result<()> {
 }
 
 pub fn open_wav(path: &Path) -> io::Result<(Header, BitDepth)> {
-    let mut input_file = File::open(&path)?;
+    let mut input_file = File::open(path)?;
     wav::read(&mut input_file)
 }
 
