@@ -68,17 +68,18 @@ impl eframe::App for MyApp {
                 AppState::Idle => {
                     let mut dropped_files = self.dropped_files.lock().unwrap();
                     let file: PathBuf = dropped_files.pop().unwrap().path.unwrap();
-                    let state_store = Arc::clone(&self.app_state);
+                    if file.extension().unwrap_or_default() == "wav" {
+                        let state_store = Arc::clone(&self.app_state);
 
-                    *self.app_state.lock().unwrap() = AppState::Converting;
+                        *self.app_state.lock().unwrap() = AppState::Converting;
 
-                    thread::spawn(move || {
-                        if let Err(e) = convert_to_mono(file) {
-                            eprintln!("{}", e);
-                        }
-
-                        *state_store.lock().unwrap() = AppState::Idle;
-                    });
+                        thread::spawn(move || {
+                            if let Err(e) = convert_to_mono(file) {
+                                eprintln!("{}", e);
+                            }
+                            *state_store.lock().unwrap() = AppState::Idle;
+                        });
+                    }
                 }
                 AppState::Converting => {
                     println!("app state converting");
