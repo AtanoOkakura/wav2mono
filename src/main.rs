@@ -47,7 +47,7 @@ impl eframe::App for MyApp {
                 ui.group(|ui| {
                     ui.label("Converting to mono:");
 
-                    for file in dropped_files.clone() {
+                    for file in dropped_files.iter() {
                         let info = if let Some(path) = &file.path {
                             path.display().to_string()
                         } else if !file.name.is_empty() {
@@ -66,20 +66,18 @@ impl eframe::App for MyApp {
             let app_state = *self.app_state.lock().unwrap();
             match app_state {
                 AppState::Idle => {
-                    let mut dropped_files = self.dropped_files.lock().unwrap();
-                    let file: PathBuf = dropped_files.pop().unwrap().path.unwrap();
-                    if file.extension().unwrap_or_default() == "wav" {
-                        let state_store = Arc::clone(&self.app_state);
+                    let state_store = Arc::clone(&self.app_state);
 
-                        *self.app_state.lock().unwrap() = AppState::Converting;
+                    *self.app_state.lock().unwrap() = AppState::Converting;
+                    let ctx_store = ctx.clone();
+                    let file = Arc::clone(&self.dropped_files);
 
-                        thread::spawn(move || {
-                            if let Err(e) = convert_to_mono(file) {
-                                eprintln!("{}", e);
-                            }
-                            *state_store.lock().unwrap() = AppState::Idle;
-                        });
-                    }
+                    thread::spawn(move || {
+                        if let Err(e) = convert_to_mono(file, &ctx_store) {
+                            eprintln!("{}", e);
+                        }
+                        *state_store.lock().unwrap() = AppState::Idle;
+                    });
                 }
                 AppState::Converting => {
                     println!("app state converting");
@@ -93,19 +91,40 @@ impl eframe::App for MyApp {
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
                 let mut dropped_files = self.dropped_files.lock().unwrap();
-                *dropped_files = i.raw.dropped_files.clone();
+                for f in i.raw.dropped_files.iter() {
+                    dropped_files.push(f.clone());
+                }
             }
         });
     }
 }
 
-fn convert_to_mono(file: PathBuf) -> io::Result<()> {
-    let output = file
-        .parent()
-        .unwrap()
-        .join("mono")
-        .join(file.file_name().unwrap());
-    Wav::open(&file).to_mono().write(&output)?;
+fn convert_to_mono(
+    files: Arc<Mutex<Vec<egui::DroppedFile>>>,
+    ctx: &egui::Context,
+) -> io::Result<()> {
+    loop {
+        if files.lock().unwrap().is_empty() {
+            break;
+        }
+
+        let file = files.lock().unwrap().remove(0);
+        let Some(input) = file.path else {
+            continue;
+        };
+
+        if input.extension().unwrap_or_default() != "wav" {
+            continue;
+        }
+
+        let output = input
+            .parent()
+            .unwrap()
+            .join("mono")
+            .join(input.file_name().unwrap());
+        Wav::open(&input).to_mono().write(&output)?;
+        ctx.request_repaint();
+    }
     Ok(())
 }
 
@@ -149,6 +168,7 @@ fn main() -> eframe::Result<()> {
         drag_and_drop_support: true,
         always_on_top: true,
         initial_window_size: Some(egui::vec2(320.0, 240.0)),
+
         ..eframe::NativeOptions::default()
     };
     eframe::run_native(
