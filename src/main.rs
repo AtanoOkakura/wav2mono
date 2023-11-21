@@ -93,7 +93,9 @@ impl eframe::App for MyApp {
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
                 let mut dropped_files = self.dropped_files.lock().unwrap();
-                *dropped_files = i.raw.dropped_files.clone();
+                for f in i.raw.dropped_files.iter() {
+                    dropped_files.push(f.clone());
+                }
             }
         });
     }
