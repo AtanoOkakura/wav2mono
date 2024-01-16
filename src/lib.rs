@@ -39,10 +39,12 @@ pub fn to_mono(header: Header, data: BitDepth) -> Option<(Header, BitDepth)> {
         None
     } else {
         let channel_count = header.channel_count;
-        let new_header = Header {
-            channel_count: 1,
-            ..header
-        };
+        let new_header = Header::new(
+            wav::header::WAV_FORMAT_PCM,
+            1,
+            header.sampling_rate,
+            header.bits_per_sample,
+        );
         let new_data = match data {
             BitDepth::Eight(d) => BitDepth::Eight(to_mono_data(d.clone(), channel_count)),
             BitDepth::Sixteen(d) => BitDepth::Sixteen(to_mono_data(d.clone(), channel_count)),
