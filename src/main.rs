@@ -1,10 +1,11 @@
 #![windows_subsystem = "windows"]
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 
+use eframe::egui::viewport;
+use eframe::egui::ViewportBuilder;
 use wav2mono::Wav;
 
 use eframe::egui;
@@ -163,12 +164,22 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
     }
 }
 
-fn main() -> eframe::Result<()> {
-    let native_options = eframe::NativeOptions {
-        drag_and_drop_support: true,
-        always_on_top: true,
-        initial_window_size: Some(egui::vec2(320.0, 240.0)),
+// const ICON: &[u8] = include_bytes!("../assets/wav2mono_icon.png");
 
+fn main() -> eframe::Result<()> {
+    let view_port = ViewportBuilder::default()
+        .with_always_on_top()
+        .with_title(concat!("wav2mono ver", env!("CARGO_PKG_VERSION")))
+        // .with_icon(viewport::IconData {
+        //     rgba: ICON.to_vec(),
+        //     width: 58,
+        //     height: 58,
+        // })
+        .with_drag_and_drop(true)
+        .with_inner_size(egui::vec2(320.0, 240.0));
+
+    let native_options = eframe::NativeOptions {
+        viewport: view_port,
         ..eframe::NativeOptions::default()
     };
     eframe::run_native(
