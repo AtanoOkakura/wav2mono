@@ -2889,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "wav2mono"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "eframe",
  "hound",
