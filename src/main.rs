@@ -3,29 +3,32 @@ use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
+use wav2mono::process_wav_file;
 
-use eframe::egui::viewport;
 use eframe::egui::ViewportBuilder;
-use wav2mono::Wav;
 
 use eframe::egui;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum AppState {
+    #[default]
     Idle,
     Converting,
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 #[derive(Default, Debug)]
 struct MyApp {
     dropped_files: Arc<Mutex<Vec<egui::DroppedFile>>>,
     app_state: Arc<Mutex<AppState>>,
+}
+
+impl MyApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // set theme to system theme
+        cc.egui_ctx.set_visuals(egui::Visuals::light());
+
+        Self::default()
+    }
 }
 
 impl eframe::App for MyApp {
@@ -118,12 +121,10 @@ fn convert_to_mono(
             continue;
         }
 
-        let output = input
-            .parent()
-            .unwrap()
-            .join("mono")
-            .join(input.file_name().unwrap());
-        Wav::open(&input).to_mono().write(&output)?;
+        process_wav_file(input.as_ref()).map_err(|e| {
+            io::Error::other(format!("Failed to process file {}: {}", input.display(), e))
+        })?;
+
         ctx.request_repaint();
     }
     Ok(())
@@ -152,7 +153,7 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
         let painter =
             ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = ctx.content_rect();
         painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
         painter.text(
             screen_rect.center(),
@@ -185,6 +186,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         concat!("wav2mono ver", env!("CARGO_PKG_VERSION")),
         native_options,
-        Box::new(|_cc| Box::<MyApp>::default()),
+        Box::new(|cc| Ok(Box::new(MyApp::new(cc)))),
     )
 }

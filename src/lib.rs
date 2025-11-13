@@ -1,134 +1,221 @@
+use hound::{SampleFormat, WavReader, WavWriter};
+use std::error::Error;
 use std::fs;
-use std::fs::File;
-use std::io;
 use std::path::Path;
 
-use wav::bit_depth::BitDepth;
-use wav::header::Header;
+// --- 判定結果の型 ---
+#[derive(Debug, PartialEq, Copy, Clone)]
+enum StereoType {
+    DualMono,   // 実質モノラル
+    TrueStereo, // ガチステレオ
+}
 
-pub fn wav_files_to_mono(dir: &str) -> io::Result<()> {
-    for f in fs::read_dir(dir)? {
-        let f = f?;
-        let path = f.path();
-        if path.extension().unwrap_or_default() == "wav" {
-            wav_file_to_mono(&path)?
+// --- 1. 判定関数 (Int/Float 呼び分け用) ---
+
+/// 1-1. 整数形式 (Int) の判定関数 (許容範囲付き)
+/// 💡 (l - r).abs() > TOLERANCE で比較
+fn check_stereo_type_int<S>(
+    mut reader: WavReader<impl std::io::Read>,
+) -> Result<StereoType, hound::Error>
+where
+    S: hound::Sample + Copy + 'static,
+{
+    // 許容するLSBの数。2 LSBs までをノイズと見なす！
+    const INT_TOLERANCE: i16 = 2;
+
+    let mut samples = reader.samples::<S>();
+    let mut cnt = 0;
+    while let (Some(l_res), Some(r_res)) = (samples.next(), samples.next()) {
+        // 💡 i64 にキャストして計算 (符号付き整数ならすべて安全に計算できる)
+        let l = l_res?.as_i16();
+        let r = r_res?.as_i16();
+
+        let diff = (l - r).abs();
+
+        if diff > INT_TOLERANCE {
+            println!(
+                "Debug: l = {}, r = {}, diff = {}, cnt = {}",
+                l, r, diff, cnt
+            );
+            // 許容範囲を超えたらステレオ確定！
+            return Ok(StereoType::TrueStereo);
+        }
+
+        if cnt >= 1_000_000 {
+            // 100万サンプル調べたら打ち切り
+            break;
+        }
+        cnt += 1;
+    }
+    Ok(StereoType::DualMono)
+}
+/// 1-2. 浮動小数点形式 (Float, f32) の判定関数
+/// 💡 (l - r).abs() > MONO_EPSILON の許容範囲比較
+fn check_stereo_type_float(
+    mut reader: WavReader<impl std::io::Read>,
+) -> Result<StereoType, hound::Error> {
+    // 許容範囲: 16bitの約3ステップ分くらい
+    const MONO_EPSILON: f32 = 0.0001;
+    let mut samples = reader.samples::<f32>();
+
+    while let (Some(l_res), Some(r_res)) = (samples.next(), samples.next()) {
+        if (l_res? - r_res?).abs() > MONO_EPSILON {
+            // 差が許容範囲を超えたらガチステレオ確定！
+            return Ok(StereoType::TrueStereo);
         }
     }
+    Ok(StereoType::DualMono)
+}
+
+// --- 2. 抜き出し関数 (ジェネリック版) ---
+
+/// 2-1. 1チャンネル目 (Lch) だけを抜き出す
+/// 💡 S型のまま読み込み、S型のまま書き込むため、型不一致エラーは起きない！
+fn extract_left_channel<S>(
+    mut reader: WavReader<impl std::io::Read>,
+    mut writer: WavWriter<impl std::io::Write + std::io::Seek>,
+    channels: u16, // 2ch が渡されるハズ
+) -> Result<(), hound::Error>
+where
+    S: hound::Sample + 'static,
+{
+    let mut samples = reader.samples::<S>();
+
+    while let Some(l_res) = samples.next() {
+        let l = l_res?;
+        writer.write_sample(l)?; // Lch を書き込み
+
+        // 2チャンネル目以降を読み飛ばす
+        for _ in 1..channels {
+            if samples.next().is_none() {
+                break;
+            }
+        }
+    }
+
+    writer.finalize()?;
     Ok(())
 }
 
-pub fn wav_file_to_mono(path: &Path) -> io::Result<()> {
-    let (header, data) = open_wav(path)?;
-    let (header, data) = to_mono(header, data)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to convert to mono"))?;
-    write_wav(path, header, data)
-}
+// --- 3. メイン処理関数 ---
 
-pub fn open_wav(path: &Path) -> io::Result<(Header, BitDepth)> {
-    let mut input_file = File::open(path)?;
-    wav::read(&mut input_file)
-}
+pub fn process_wav_file(input_path: &Path) -> Result<String, Box<dyn Error>> {
+    // --- 3-1. 初期準備 ---
+    let parent_dir = input_path.parent().ok_or("親フォルダが見つからないよ！")?;
+    let file_name = input_path
+        .file_name()
+        .ok_or("ファイル名が取得できないよ！")?;
+    let mono_dir = parent_dir.join("mono");
+    let stereo_dir = parent_dir.join("stereo");
+    let multichannel_dir = parent_dir.join("multichannel");
+    let mono_output_path = mono_dir.join(file_name);
+    let stereo_output_path = stereo_dir.join(file_name);
+    let multichannel_output_path = multichannel_dir.join(file_name);
 
-pub fn write_wav(path: &Path, header: Header, data: BitDepth) -> io::Result<()> {
-    let mut output_file = File::create(path)?;
-    wav::write(header, &data, &mut output_file)
-}
+    // 最初に reader を開いて spec を取得 (DualMonoで再利用するかも)
+    let reader = WavReader::open(input_path)?;
+    let spec = reader.spec();
 
-pub fn to_mono(header: Header, data: BitDepth) -> Option<(Header, BitDepth)> {
-    if data.is_empty() {
-        None
-    } else {
-        let channel_count = header.channel_count;
-        let new_header = Header::new(
-            wav::header::WAV_FORMAT_PCM,
-            1,
-            header.sampling_rate,
-            header.bits_per_sample,
-        );
-        let new_data = match data {
-            BitDepth::Eight(d) => BitDepth::Eight(to_mono_data(d.clone(), channel_count)),
-            BitDepth::Sixteen(d) => BitDepth::Sixteen(to_mono_data(d.clone(), channel_count)),
-            BitDepth::TwentyFour(d) => BitDepth::TwentyFour(to_mono_data(d.clone(), channel_count)),
-            BitDepth::ThirtyTwoFloat(d) => {
-                BitDepth::ThirtyTwoFloat(to_mono_data(d.clone(), channel_count))
-            }
-            _ => unreachable!(),
-        };
-        Some((new_header, new_data))
-    }
-}
-
-fn to_mono_data<Int>(data: Vec<Int>, channels_count: u16) -> Vec<Int>
-where
-    Int: Clone,
-{
-    data.chunks(channels_count as usize)
-        .map(|chunk| chunk[0].clone())
-        .collect()
-}
-
-pub struct Wav {
-    header: Header,
-    data: BitDepth,
-}
-
-impl Wav {
-    pub fn new(header: Header, data: BitDepth) -> Self {
-        Wav { header, data }
-    }
-
-    pub fn open(path: &Path) -> Self {
-        let (h, d) = open_wav(path).unwrap_or_else(|_| panic!("Can't open {:?}", path));
-        Wav::new(h, d)
-    }
-
-    pub fn write(&self, path: &Path) -> io::Result<()> {
-        //create directory if missing
-        let dir = path.parent().unwrap();
-        if !dir.exists() {
-            fs::create_dir_all(dir)?;
+    // --- 3-2. チャンネル数で分岐 ---
+    match spec.channels {
+        // --- 1ch (モノラル) の場合 ---
+        1 => {
+            fs::create_dir_all(&mono_dir)?;
+            fs::copy(input_path, mono_output_path)?;
+            Ok(format!(
+                "{} は 1ch だから 'mono' にコピーしたよ！",
+                file_name.to_string_lossy()
+            ))
         }
-        //write wav file
-        write_wav(path, self.header, self.data.clone())
-    }
 
-    pub fn to_mono(&mut self) -> &mut Wav {
-        let (h, d) = to_mono(self.header, self.data.clone()).unwrap();
-        self.header = h;
-        self.data = d;
-        self
-    }
-}
+        // --- 2ch (ステレオ) の場合 ---
+        2 => {
+            // 💡 【判定ブロック】 spec に合わせて判定関数を呼び分ける！
+            let stereo_type = match (spec.sample_format, spec.bits_per_sample) {
+                // Int 形式なら Int 用の厳密判定を呼ぶ
+                (SampleFormat::Int, 8) => {
+                    check_stereo_type_int::<i8>(WavReader::open(input_path)?)?
+                }
+                (SampleFormat::Int, 16) => {
+                    check_stereo_type_int::<i16>(WavReader::open(input_path)?)?
+                }
+                // 24bit/32bit Int は i32 で読む
+                (SampleFormat::Int, 24) | (SampleFormat::Int, 32) => {
+                    check_stereo_type_int::<i32>(WavReader::open(input_path)?)?
+                }
 
-//test
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
+                // Float 形式なら Float 用のイプシロン判定を呼ぶ
+                (SampleFormat::Float, 32) => check_stereo_type_float(WavReader::open(input_path)?)?,
 
-    //test open wave file
-    #[test]
-    fn test_open_wav() {
-        let (header, data) = open_wav(Path::new("test/test.wav")).unwrap();
-        println!("{:?}", header);
-        println!("{}", data.is_eight());
-        assert_eq!(header.channel_count, 2);
-        assert!(data.is_sixteen());
-    }
+                _ => {
+                    return Err(Box::from(format!(
+                        "2ch だけど、この形式 ({:?} / {} bits) は対応してないかも...ごめん！",
+                        spec.sample_format, spec.bits_per_sample
+                    )));
+                }
+            };
 
-    #[test]
-    fn test_path() {
-        let path = Path::new("test/mono/test.wav");
-        println!("Path is: {:?}", path);
-        assert!(path.is_relative());
-        assert!(path.exists());
-        assert_eq!(path.parent().unwrap().to_str().unwrap(), "test/mono");
-    }
+            // 判定結果によって処理を分ける
+            match stereo_type {
+                // ガチステレオ (TrueStereo)
+                StereoType::TrueStereo => {
+                    fs::create_dir_all(&stereo_dir)?;
+                    fs::copy(input_path, stereo_output_path)?;
+                    Ok(format!(
+                        "{} はガチステレオだから 'stereo' にコピーしたよ！",
+                        file_name.to_string_lossy()
+                    ))
+                }
 
-    #[test]
-    fn test_wav_to_mono() {
-        let mut wav = Wav::open(Path::new("test/test.wav"));
-        wav.to_mono();
-        assert!(wav.write(Path::new("test/mono/test.wav")).is_ok());
+                // 実質モノラル (DualMono)
+                StereoType::DualMono => {
+                    fs::create_dir_all(&mono_dir)?;
+
+                    let mut mono_spec = spec;
+                    mono_spec.channels = 1;
+
+                    let writer = WavWriter::create(&mono_output_path, mono_spec)?;
+
+                    // 💡 【修正点】抜き出し用の reader をここでファイル先頭から作り直す！
+                    //    （前回のエラー対策）
+                    let reader_for_extract = WavReader::open(input_path)?;
+
+                    // 💡 【抜き出しブロック】 spec に合わせて抽出関数を呼び分ける！
+                    match (spec.sample_format, spec.bits_per_sample) {
+                        (SampleFormat::Int, 8) => {
+                            extract_left_channel::<i8>(reader_for_extract, writer, spec.channels)?
+                        }
+                        (SampleFormat::Int, 16) => {
+                            extract_left_channel::<i16>(reader_for_extract, writer, spec.channels)?
+                        }
+                        (SampleFormat::Int, 24) | (SampleFormat::Int, 32) => {
+                            extract_left_channel::<i32>(reader_for_extract, writer, spec.channels)?
+                        }
+                        (SampleFormat::Float, 32) => {
+                            extract_left_channel::<f32>(reader_for_extract, writer, spec.channels)?
+                        }
+                        // 判定ブロックで弾かれているので unreachable!
+                        _ => unreachable!(),
+                    }
+
+                    Ok(format!(
+                        "{} は実質モノラルだったから Lch を 'mono' に抜き出したよ！",
+                        file_name.to_string_lossy()
+                    ))
+                }
+            }
+        }
+
+        // --- 3ch 以上のファイル ---
+        _ => {
+            // copy multichannel files to "multichannel" folder
+            fs::create_dir_all(&multichannel_dir)?;
+            fs::copy(input_path, multichannel_output_path)?;
+            Ok(format!(
+                "{} は {}ch だから 'multichannel' にコピーしたよ！",
+                file_name.to_string_lossy(),
+                spec.channels
+            ))
+        }
     }
 }
