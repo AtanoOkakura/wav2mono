@@ -1,7 +1,7 @@
 use hound::{SampleFormat, WavReader, WavWriter};
 use std::error::Error;
-use std::fs;
 use std::path::Path;
+use std::{fs, io};
 
 // --- 判定結果の型 ---
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -10,64 +10,102 @@ enum StereoType {
     TrueStereo, // ガチステレオ
 }
 
-// --- 1. 判定関数 (Int/Float 呼び分け用) ---
+fn is_dual_mono(path: &Path) -> hound::Result<StereoType> {
+    let mut reader = WavReader::open(path)?;
+    let spec = reader.spec();
 
-/// 1-1. 整数形式 (Int) の判定関数 (許容範囲付き)
-/// 💡 (l - r).abs() > TOLERANCE で比較
-fn check_stereo_type_int<S>(
-    mut reader: WavReader<impl std::io::Read>,
-) -> Result<StereoType, hound::Error>
-where
-    S: hound::Sample + Copy + 'static,
-{
-    // 許容するLSBの数。2 LSBs までをノイズと見なす！
-    const INT_TOLERANCE: i16 = 2;
+    if spec.channels != 2 {
+        return Ok(StereoType::DualMono);
+    }
 
-    let mut samples = reader.samples::<S>();
-    let mut cnt = 0;
-    while let (Some(l_res), Some(r_res)) = (samples.next(), samples.next()) {
-        // 💡 i64 にキャストして計算 (符号付き整数ならすべて安全に計算できる)
-        let l = l_res?.as_i16();
-        let r = r_res?.as_i16();
+    let sample_rate = spec.sample_rate;
+    let bits = spec.bits_per_sample;
+    let format = spec.sample_format;
 
-        let diff = (l - r).abs();
+    // しきい値設定
+    let silence_threshold = 10f32.powf(-60.0 / 20.0);
+    let mono_diff_threshold = 10f32.powf(-60.0 / 20.0);
+    let max_analyze_samples = 10 * sample_rate as usize;
 
-        if diff > INT_TOLERANCE {
-            println!(
-                "Debug: l = {}, r = {}, diff = {}, cnt = {}",
-                l, r, diff, cnt
-            );
-            // 許容範囲を超えたらステレオ確定！
-            return Ok(StereoType::TrueStereo);
+    // 各型をf32に正規化するクロージャ
+    // 24bitの場合は i32 として読み込み、2^23-1 で割る
+    let to_f32 = move |sample: Result<i32, hound::Error>| -> f32 {
+        let s = sample.unwrap_or(0);
+        match (format, bits) {
+            (SampleFormat::Int, 16) => s as f32 / i16::MAX as f32,
+            (SampleFormat::Int, 24) => s as f32 / 8_388_607.0, // 2^23 - 1
+            (SampleFormat::Int, 32) => s as f32 / i32::MAX as f32,
+            _ => 0.0,
+        }
+    };
+
+    // Houndのサンプルイテレータを正規化されたf32のイテレータに変換
+    let mut samples: Box<dyn Iterator<Item = f32>> = match (format, bits) {
+        (SampleFormat::Float, 32) => Box::new(reader.samples::<f32>().map(|s| s.unwrap_or(0.0))),
+        (SampleFormat::Int, _) => Box::new(reader.samples::<i32>().map(to_f32)),
+        _ => {
+            return Err(hound::Error::IoError(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unsupported sample format for dual-mono check",
+            )))
+        }
+    };
+
+    let mut side_energy_sum = 0.0f64;
+    let mut analyzed_count = 0usize;
+    let mut is_started = false;
+    let mut silence_samples = 0usize;
+
+    // L/Rペアで回す
+    while let (Some(l), Some(r)) = (samples.next(), samples.next()) {
+        if !is_started {
+            silence_samples += 1;
+            if l.abs() > silence_threshold || r.abs() > silence_threshold {
+                #[cfg(debug_assertions)]
+                {
+                    println!("Debug: l.abs() = {}", l.abs());
+                    println!("Debug: r.abs() = {}", r.abs());
+                    println!(
+                        "Debug: silence seconds = {}",
+                        silence_samples as f32 / sample_rate as f32
+                    );
+                }
+                is_started = true;
+            } else {
+                continue;
+            }
         }
 
-        if cnt >= 1_000_000 {
-            // 100万サンプル調べたら打ち切り
+        let side = (l - r) as f64;
+        side_energy_sum += side * side;
+        analyzed_count += 1;
+
+        if analyzed_count >= max_analyze_samples {
             break;
         }
-        cnt += 1;
     }
-    Ok(StereoType::DualMono)
-}
-/// 1-2. 浮動小数点形式 (Float, f32) の判定関数
-/// 💡 (l - r).abs() > MONO_EPSILON の許容範囲比較
-fn check_stereo_type_float(
-    mut reader: WavReader<impl std::io::Read>,
-) -> Result<StereoType, hound::Error> {
-    // 許容範囲: 16bitの約3ステップ分くらい
-    const MONO_EPSILON: f32 = 0.0001;
-    let mut samples = reader.samples::<f32>();
 
-    while let (Some(l_res), Some(r_res)) = (samples.next(), samples.next()) {
-        if (l_res? - r_res?).abs() > MONO_EPSILON {
-            // 差が許容範囲を超えたらガチステレオ確定！
-            return Ok(StereoType::TrueStereo);
-        }
+    // サンプルが一つも解析されなかった場合は実質モノラルと見なす
+    if analyzed_count == 0 {
+        return Ok(StereoType::DualMono);
     }
-    Ok(StereoType::DualMono)
-}
 
-// --- 2. 抜き出し関数 (ジェネリック版) ---
+    let side_rms = (side_energy_sum / analyzed_count as f64).sqrt() as f32;
+
+    #[cfg(debug_assertions)]
+    {
+        println!("Debug: side_rms = {}", side_rms);
+        println!("Debug: analyzed_count = {}", analyzed_count);
+        println!("Debug: silence_threshold = {}", silence_threshold);
+        println!("Debug: mono_diff_threshold = {}", mono_diff_threshold);
+    }
+
+    if side_rms < mono_diff_threshold {
+        Ok(StereoType::DualMono)
+    } else {
+        Ok(StereoType::TrueStereo)
+    }
+}
 
 /// 2-1. 1チャンネル目 (Lch) だけを抜き出す
 /// 💡 S型のまま読み込み、S型のまま書き込むため、型不一致エラーは起きない！
@@ -122,6 +160,7 @@ pub fn process_wav_file(input_path: &Path) -> Result<String, Box<dyn Error>> {
         1 => {
             fs::create_dir_all(&mono_dir)?;
             fs::copy(input_path, mono_output_path)?;
+            fs::remove_file(input_path)?;
             Ok(format!(
                 "{} は 1ch だから 'mono' にコピーしたよ！",
                 file_name.to_string_lossy()
@@ -130,30 +169,7 @@ pub fn process_wav_file(input_path: &Path) -> Result<String, Box<dyn Error>> {
 
         // --- 2ch (ステレオ) の場合 ---
         2 => {
-            // 💡 【判定ブロック】 spec に合わせて判定関数を呼び分ける！
-            let stereo_type = match (spec.sample_format, spec.bits_per_sample) {
-                // Int 形式なら Int 用の厳密判定を呼ぶ
-                (SampleFormat::Int, 8) => {
-                    check_stereo_type_int::<i8>(WavReader::open(input_path)?)?
-                }
-                (SampleFormat::Int, 16) => {
-                    check_stereo_type_int::<i16>(WavReader::open(input_path)?)?
-                }
-                // 24bit/32bit Int は i32 で読む
-                (SampleFormat::Int, 24) | (SampleFormat::Int, 32) => {
-                    check_stereo_type_int::<i32>(WavReader::open(input_path)?)?
-                }
-
-                // Float 形式なら Float 用のイプシロン判定を呼ぶ
-                (SampleFormat::Float, 32) => check_stereo_type_float(WavReader::open(input_path)?)?,
-
-                _ => {
-                    return Err(Box::from(format!(
-                        "2ch だけど、この形式 ({:?} / {} bits) は対応してないかも...ごめん！",
-                        spec.sample_format, spec.bits_per_sample
-                    )));
-                }
-            };
+            let stereo_type = is_dual_mono(input_path)?;
 
             // 判定結果によって処理を分ける
             match stereo_type {
@@ -161,6 +177,7 @@ pub fn process_wav_file(input_path: &Path) -> Result<String, Box<dyn Error>> {
                 StereoType::TrueStereo => {
                     fs::create_dir_all(&stereo_dir)?;
                     fs::copy(input_path, stereo_output_path)?;
+                    fs::remove_file(input_path)?;
                     Ok(format!(
                         "{} はガチステレオだから 'stereo' にコピーしたよ！",
                         file_name.to_string_lossy()
@@ -211,6 +228,7 @@ pub fn process_wav_file(input_path: &Path) -> Result<String, Box<dyn Error>> {
             // copy multichannel files to "multichannel" folder
             fs::create_dir_all(&multichannel_dir)?;
             fs::copy(input_path, multichannel_output_path)?;
+            fs::remove_file(input_path)?;
             Ok(format!(
                 "{} は {}ch だから 'multichannel' にコピーしたよ！",
                 file_name.to_string_lossy(),
