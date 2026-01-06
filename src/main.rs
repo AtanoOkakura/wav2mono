@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 
-use wav2mono::Wav;
+use wav2mono::process_wav_file;
 
 use eframe::egui;
 
@@ -252,6 +252,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         concat!("wav2mono ver", env!("CARGO_PKG_VERSION")),
         native_options,
-        Box::new(|_cc| Box::<MyApp>::default()),
+        Box::new(|cc| Ok(Box::new(MyApp::new(cc)))),
     )
 }
