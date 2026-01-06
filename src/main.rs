@@ -1,11 +1,9 @@
-#![windows_subsystem = "windows"]
-use std::io;
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
-use wav2mono::process_wav_file;
 
-use eframe::egui::ViewportBuilder;
+use wav2mono::process_wav_file;
 
 use eframe::egui;
 
@@ -16,14 +14,53 @@ enum AppState {
     Converting,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileStatus {
+    Pending,
+    Processing,
+    Success(String),
+    Error(String),
+}
+
+#[derive(Debug, Clone)]
+struct ProcessTask {
+    path: std::path::PathBuf,
+    status: FileStatus,
+}
+
+#[derive(Default)]
 struct MyApp {
-    dropped_files: Arc<Mutex<Vec<egui::DroppedFile>>>,
+    tasks: Arc<Mutex<Vec<ProcessTask>>>,
     app_state: Arc<Mutex<AppState>>,
 }
 
 impl MyApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Load Japanese font for Windows
+        let mut fonts = egui::FontDefinitions::default();
+        
+        let font_path = "C:\\Windows\\Fonts\\msgothic.ttc";
+        if std::path::Path::new(font_path).exists() {
+            if let Ok(font_data) = std::fs::read(font_path) {
+                fonts.font_data.insert(
+                    "msgothic".to_owned(),
+                    Arc::new(egui::FontData::from_owned(font_data)),
+                );
+                
+                fonts.families
+                    .get_mut(&egui::FontFamily::Proportional)
+                    .unwrap()
+                    .insert(0, "msgothic".to_owned());
+                
+                fonts.families
+                    .get_mut(&egui::FontFamily::Monospace)
+                    .unwrap()
+                    .insert(0, "msgothic".to_owned());
+                
+                cc.egui_ctx.set_fonts(fonts);
+            }
+        }
+
         // set theme to system theme
         cc.egui_ctx.set_visuals(egui::Visuals::light());
 
@@ -43,49 +80,66 @@ impl eframe::App for MyApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("Drag-and-drop files onto the window!");
+            ui.label("Drag-and-drop WAV files onto the window!");
 
-            let dropped_files = self.dropped_files.lock().unwrap();
-            // Show dropped files (if any):
-            if !dropped_files.is_empty() {
-                ui.group(|ui| {
-                    ui.label("Converting to mono:");
+            let tasks = self.tasks.lock().unwrap();
+            if !tasks.is_empty() {
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for task in tasks.iter() {
+                        ui.horizontal(|ui| {
+                            let (icon, color) = match &task.status {
+                                FileStatus::Pending => ("⏳", egui::Color32::GRAY),
+                                FileStatus::Processing => ("🔄", egui::Color32::BLUE),
+                                FileStatus::Success(_) => ("✅", egui::Color32::GREEN),
+                                FileStatus::Error(_) => ("❌", egui::Color32::RED),
+                            };
 
-                    for file in dropped_files.iter() {
-                        let info = if let Some(path) = &file.path {
-                            path.display().to_string()
-                        } else if !file.name.is_empty() {
-                            file.name.clone()
-                        } else {
-                            "???".to_owned()
-                        };
-
-                        ui.label(info);
+                            ui.colored_label(color, icon);
+                            
+                            let name = task.path.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "???".to_string());
+                            
+                            let label = ui.label(&name);
+                            
+                            match &task.status {
+                                FileStatus::Success(msg) => {
+                                    label.on_hover_text(msg);
+                                }
+                                FileStatus::Error(err) => {
+                                    label.on_hover_text(err);
+                                }
+                                _ => {}
+                            }
+                        });
                     }
                 });
             }
         });
 
-        if !self.dropped_files.lock().unwrap().is_empty() {
+        let has_pending = {
+            let tasks = self.tasks.lock().unwrap();
+            tasks.iter().any(|t| matches!(t.status, FileStatus::Pending))
+        };
+
+        if has_pending {
             let app_state = *self.app_state.lock().unwrap();
             match app_state {
                 AppState::Idle => {
                     let state_store = Arc::clone(&self.app_state);
-
                     *self.app_state.lock().unwrap() = AppState::Converting;
+                    
+                    let tasks = Arc::clone(&self.tasks);
                     let ctx_store = ctx.clone();
-                    let file = Arc::clone(&self.dropped_files);
 
                     thread::spawn(move || {
-                        if let Err(e) = convert_to_mono(file, &ctx_store) {
-                            eprintln!("{}", e);
-                        }
+                        run_conversion_loop(tasks, &ctx_store);
                         *state_store.lock().unwrap() = AppState::Idle;
+                        ctx_store.request_repaint();
                     });
                 }
-                AppState::Converting => {
-                    println!("app state converting");
-                }
+                AppState::Converting => {}
             }
         }
 
@@ -94,40 +148,63 @@ impl eframe::App for MyApp {
         // Collect dropped files:
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
-                let mut dropped_files = self.dropped_files.lock().unwrap();
+                let mut tasks = self.tasks.lock().unwrap();
                 for f in i.raw.dropped_files.iter() {
-                    dropped_files.push(f.clone());
+                    if let Some(path) = &f.path {
+                        if path.extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|s| s.to_ascii_lowercase()) == Some("wav".to_string()) 
+                        {
+                            tasks.push(ProcessTask {
+                                path: path.clone(),
+                                status: FileStatus::Pending,
+                            });
+                        }
+                    }
                 }
             }
         });
     }
 }
 
-fn convert_to_mono(
-    files: Arc<Mutex<Vec<egui::DroppedFile>>>,
+fn run_conversion_loop(
+    tasks: Arc<Mutex<Vec<ProcessTask>>>,
     ctx: &egui::Context,
-) -> io::Result<()> {
+) {
     loop {
-        if files.lock().unwrap().is_empty() {
+        let mut index = None;
+        {
+            let mut tasks_lock = tasks.lock().unwrap();
+            for (i, task) in tasks_lock.iter_mut().enumerate() {
+                if matches!(task.status, FileStatus::Pending) {
+                    task.status = FileStatus::Processing;
+                    index = Some(i);
+                    break;
+                }
+            }
+        }
+        ctx.request_repaint();
+
+        if let Some(idx) = index {
+            let path = {
+                let tasks_lock = tasks.lock().unwrap();
+                tasks_lock[idx].path.clone()
+            };
+
+            let result = process_wav_file(&path);
+
+            {
+                let mut tasks_lock = tasks.lock().unwrap();
+                match result {
+                    Ok(msg) => tasks_lock[idx].status = FileStatus::Success(msg),
+                    Err(e) => tasks_lock[idx].status = FileStatus::Error(e.to_string()),
+                }
+            }
+            ctx.request_repaint();
+        } else {
             break;
         }
-
-        let file = files.lock().unwrap().remove(0);
-        let Some(input) = file.path else {
-            continue;
-        };
-
-        if input.extension().unwrap_or_default() != "wav" {
-            continue;
-        }
-
-        process_wav_file(input.as_ref()).map_err(|e| {
-            io::Error::other(format!("Failed to process file {}: {}", input.display(), e))
-        })?;
-
-        ctx.request_repaint();
     }
-    Ok(())
 }
 
 /// Preview hovering files:
@@ -153,7 +230,7 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
         let painter =
             ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
 
-        let screen_rect = ctx.content_rect();
+        let screen_rect = ctx.screen_rect();
         painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
         painter.text(
             screen_rect.center(),
@@ -165,22 +242,13 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
     }
 }
 
-// const ICON: &[u8] = include_bytes!("../assets/wav2mono_icon.png");
-
 fn main() -> eframe::Result<()> {
-    let view_port = ViewportBuilder::default()
-        .with_always_on_top()
-        .with_title(concat!("wav2mono ver", env!("CARGO_PKG_VERSION")))
-        // .with_icon(viewport::IconData {
-        //     rgba: ICON.to_vec(),
-        //     width: 58,
-        //     height: 58,
-        // })
-        .with_drag_and_drop(true)
-        .with_inner_size(egui::vec2(320.0, 240.0));
-
     let native_options = eframe::NativeOptions {
-        viewport: view_port,
+        viewport: egui::ViewportBuilder::default()
+            .with_drag_and_drop(true)
+            .with_always_on_top()
+            .with_inner_size(egui::vec2(320.0, 240.0)),
+
         ..eframe::NativeOptions::default()
     };
     eframe::run_native(

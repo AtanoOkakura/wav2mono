@@ -179,7 +179,7 @@ pub fn process_wav_file(input_path: &Path) -> Result<String, Box<dyn Error>> {
                     fs::copy(input_path, stereo_output_path)?;
                     fs::remove_file(input_path)?;
                     Ok(format!(
-                        "{} はガチステレオだから 'stereo' にコピーしたよ！",
+                        "{} はステレオだから 'stereo' にコピーしたよ！",
                         file_name.to_string_lossy()
                     ))
                 }
@@ -235,5 +235,27 @@ pub fn process_wav_file(input_path: &Path) -> Result<String, Box<dyn Error>> {
                 spec.channels
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    #[test]
+    fn test_process_non_existent_file() {
+        let path = PathBuf::from("non_existent.wav");
+        let result = process_wav_file(&path);
+        assert!(result.is_err());
+    }
+    // 実際のwavファイルを使ったテストをここに追加していく
+
+    #[test]
+    fn test_process_wav_file() {
+        let path = PathBuf::from("./test/test.wav");
+        assert!(is_dual_mono(&path).is_ok());
+        assert_eq!(is_dual_mono(&path).unwrap(), StereoType::DualMono);
+        let result = process_wav_file(&path);
+        assert!(result.is_ok());
     }
 }
