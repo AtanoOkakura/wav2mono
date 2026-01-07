@@ -36,30 +36,26 @@ struct MyApp {
 
 impl MyApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Load Japanese font for Windows
+        // Load Embedded Japanese font (Noto Sans CJK JP)
         let mut fonts = egui::FontDefinitions::default();
         
-        let font_path = "C:\\Windows\\Fonts\\msgothic.ttc";
-        if std::path::Path::new(font_path).exists() {
-            if let Ok(font_data) = std::fs::read(font_path) {
-                fonts.font_data.insert(
-                    "msgothic".to_owned(),
-                    Arc::new(egui::FontData::from_owned(font_data)),
-                );
-                
-                fonts.families
-                    .get_mut(&egui::FontFamily::Proportional)
-                    .unwrap()
-                    .insert(0, "msgothic".to_owned());
-                
-                fonts.families
-                    .get_mut(&egui::FontFamily::Monospace)
-                    .unwrap()
-                    .insert(0, "msgothic".to_owned());
-                
-                cc.egui_ctx.set_fonts(fonts);
-            }
-        }
+        let font_data = include_bytes!("../assets/NotoSansCJKjp-Regular.otf");
+        fonts.font_data.insert(
+            "noto_sans_jp".to_owned(),
+            Arc::new(egui::FontData::from_static(font_data)),
+        );
+        
+        fonts.families
+            .get_mut(&egui::FontFamily::Proportional)
+            .unwrap()
+            .insert(0, "noto_sans_jp".to_owned());
+        
+        fonts.families
+            .get_mut(&egui::FontFamily::Monospace)
+            .unwrap()
+            .insert(0, "noto_sans_jp".to_owned());
+        
+        cc.egui_ctx.set_fonts(fonts);
 
         // set theme to system theme
         cc.egui_ctx.set_visuals(egui::Visuals::light());
