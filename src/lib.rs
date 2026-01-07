@@ -215,6 +215,7 @@ pub fn process_wav_file(input_path: &Path) -> Result<String, Box<dyn Error>> {
                         _ => unreachable!(),
                     }
 
+                    fs::remove_file(input_path)?;
                     Ok(format!(
                         "{} は実質モノラルだったから Lch を 'mono' に抜き出したよ！",
                         file_name.to_string_lossy()
